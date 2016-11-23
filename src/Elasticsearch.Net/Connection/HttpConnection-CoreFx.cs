@@ -1,14 +1,13 @@
 ﻿#if DOTNETCORE
 using System;
 using System.Collections.Concurrent;
-using System.IO;
+using System.Collections.Generic;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using static System.Net.DecompressionMethods;
 
@@ -31,10 +30,6 @@ namespace Elasticsearch.Net
 	{
 		private readonly object _lock = new object();
 		private readonly ConcurrentDictionary<int, HttpClient> _clients = new ConcurrentDictionary<int, HttpClient>();
-
-		private string DefaultContentType => "application/json";
-
-		public HttpConnection() { }
 
 		private HttpClient GetClient(RequestData requestData)
 		{
@@ -67,12 +62,13 @@ namespace Elasticsearch.Net
 			try
 			{
 				var requestMessage = CreateHttpRequestMessage(requestData);
-				var response = client.SendAsync(requestMessage, requestData.CancellationToken).GetAwaiter().GetResult();
+
+				var response = RunSynchronously(() => client.SendAsync(requestMessage, requestData.CancellationToken));
 				requestData.MadeItToResponse = true;
 				builder.StatusCode = (int)response.StatusCode;
 
 				if (response.Content != null)
-					builder.Stream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+					builder.Stream = RunSynchronously(() => response.Content.ReadAsStreamAsync());
 			}
 			catch (HttpRequestException e)
 			{
@@ -213,6 +209,57 @@ namespace Elasticsearch.Net
 		{
 			foreach (var c in _clients)
 				c.Value.Dispose();
+		}
+
+
+		/// <summary>Runs the specified asynchronous function on the current thread</summary>
+		/// <remarks>
+		/// Modified version of https://blogs.msdn.microsoft.com/pfxteam/2012/01/20/await-synchronizationcontext-and-console-apps/
+		/// </remarks>
+		private static T RunSynchronously<T>(Func<Task<T>> func)
+		{
+			var previousContext = SynchronizationContext.Current;
+			try
+			{
+				var context = new SingleThreadSynchronizationContext();
+				SynchronizationContext.SetSynchronizationContext(context);
+				var t = func();
+				t.ContinueWith(delegate { context.Complete(); }, TaskScheduler.Default);
+				context.RunOnCurrentThread();
+				return t.GetAwaiter().GetResult();
+			}
+			finally
+			{
+				SynchronizationContext.SetSynchronizationContext(previousContext);
+			}
+		}
+
+		/// <summary>Provides a SynchronizationContext that's single-threaded.</summary>
+		private sealed class SingleThreadSynchronizationContext : SynchronizationContext
+		{
+			private readonly BlockingCollection<KeyValuePair<SendOrPostCallback, object>> _queue =
+				new BlockingCollection<KeyValuePair<SendOrPostCallback, object>>();
+
+			private readonly Thread _thread = Thread.CurrentThread;
+
+			public override void Post(SendOrPostCallback d, object state)
+			{
+				if (d == null) throw new ArgumentNullException(nameof(d));
+				_queue.Add(new KeyValuePair<SendOrPostCallback, object>(d, state));
+			}
+
+			public override void Send(SendOrPostCallback d, object state)
+			{
+				throw new NotSupportedException("Synchronously sending is not supported.");
+			}
+
+			public void RunOnCurrentThread()
+			{
+				foreach (var workItem in _queue.GetConsumingEnumerable())
+					workItem.Key(workItem.Value);
+			}
+
+			public void Complete() => _queue.CompleteAdding();
 		}
 	}
 }
